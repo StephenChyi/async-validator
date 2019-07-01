@@ -1,4 +1,4 @@
-import { format, complementError, asyncMap, warning, deepMerge } from './util';
+import { format, complementError, asyncMap, warning, deepMerge, convertFieldsError } from './util';
 import validators from './validator/';
 import { messages as defaultMessages, newMessages } from './messages';
 
@@ -39,7 +39,8 @@ Schema.prototype = {
       }
     }
   },
-  validate(source_, o = {}, oc) {
+  validate(source_, o = {}, oc = () => {
+  }) {
     let source = source_;
     let options = o;
     let callback = oc;
@@ -51,17 +52,17 @@ Schema.prototype = {
       if (callback) {
         callback();
       }
-      return;
+      return Promise.resolve();
     }
+
     function complete(results) {
       let i;
-      let field;
       let errors = [];
       let fields = {};
 
       function add(e) {
         if (Array.isArray(e)) {
-          errors = errors.concat.apply(errors, e);
+          errors = errors.concat(...e);
         } else {
           errors.push(e);
         }
@@ -74,11 +75,7 @@ Schema.prototype = {
         errors = null;
         fields = null;
       } else {
-        for (i = 0; i < errors.length; i++) {
-          field = errors[i].field;
-          fields[field] = fields[field] || [];
-          fields[field].push(errors[i]);
-        }
+        fields = convertFieldsError(errors);
       }
       callback(errors, fields);
     }
@@ -132,12 +129,13 @@ Schema.prototype = {
       });
     });
     const errorFields = {};
-    asyncMap(series, options, (data, doIt) => {
+    return asyncMap(series, options, (data, doIt) => {
       const rule = data.rule;
       let deep = (rule.type === 'object' || rule.type === 'array') &&
         (typeof (rule.fields) === 'object' || typeof (rule.defaultField) === 'object');
       deep = deep && (rule.required || (!rule.required && data.value));
       rule.field = data.field;
+
       function addFullfield(key, schema) {
         return {
           ...schema,
@@ -150,7 +148,7 @@ Schema.prototype = {
         if (!Array.isArray(errors)) {
           errors = [errors];
         }
-        if (errors.length) {
+        if (!options.suppressWarning && errors.length) {
           Schema.warning('async-validator:', errors);
         }
         if (errors.length && rule.message) {
@@ -206,13 +204,33 @@ Schema.prototype = {
             data.rule.options.error = options.error;
           }
           schema.validate(data.value, data.rule.options || options, (errs) => {
-            doIt(errs && errs.length ? errors.concat(errs) : errs);
+            const finalErrors = [];
+            if (errors && errors.length) {
+              finalErrors.push(...errors);
+            }
+            if (errs && errs.length) {
+              finalErrors.push(...errs);
+            }
+            doIt(finalErrors.length ? finalErrors : null);
           });
         }
       }
 
-      const res = rule.validator(
-        rule, data.value, cb, data.source, options);
+      let res;
+      if (rule.asyncValidator) {
+        res = rule.asyncValidator(rule, data.value, cb, data.source, options);
+      } else if (rule.validator) {
+        res = rule.validator(rule, data.value, cb, data.source, options);
+        if (res === true) {
+          cb();
+        } else if (res === false) {
+          cb(rule.message || `${rule.field} fails`);
+        } else if (res instanceof Array) {
+          cb(res);
+        } else if (res instanceof Error) {
+          cb(res.message);
+        }
+      }
       if (res && res.then) {
         res.then(() => cb(), e => cb(e));
       }
